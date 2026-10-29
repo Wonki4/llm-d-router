@@ -175,6 +175,8 @@ EPP contract does not establish parity for them.
 | `vllm.clientCertPath`      | –                       | Client certificate for mTLS with the render endpoint; requires `clientKeyPath`. |
 | `vllm.clientKeyPath`       | –                       | Client private key for mTLS; requires `clientCertPath`.                      |
 | `vllm.insecureSkipVerify`  | `false`                 | Skip server certificate verification when using `https://`; `caCertPath` is ignored when set. |
+| `vllm.apiKeyEnv`           | –                       | Environment variable holding the render endpoint's API key; replaces the client's `Authorization` on render calls. Mutually exclusive with `apiKeyFile`. |
+| `vllm.apiKeyFile`          | –                       | File holding the render endpoint's API key (e.g. a mounted Secret); trailing newlines are trimmed. Mutually exclusive with `apiKeyEnv`. |
 
 The `estimate` backend tunes multimodal image placeholder estimation (empty uses
 the defaults below):
@@ -272,6 +274,16 @@ The startup warmup probe has no inbound request to borrow a credential
 from. When `VLLM_API_KEY` is set on the EPP container, the probe sends
 `Authorization: Bearer $VLLM_API_KEY`; the variable is warmup-only, and
 request paths keep forwarding the client's `Authorization` header.
+
+When the render endpoint's key differs from the clients' — typically a
+dedicated render Service — set `vllm.apiKeyEnv` (the name of an environment
+variable on the EPP container) or `vllm.apiKeyFile` (a file such as a mounted
+Secret). The key is then sent as `Authorization: Bearer <key>` on every render
+request, the warmup probe, and model-limit probes, replacing both the client's
+header and `VLLM_API_KEY`. The two fields are mutually exclusive; a plaintext
+`vllm.apiKey` is rejected so the key never lands in the plugin ConfigMap. The
+key is read once at startup, so restart EPP after rotating it. A missing
+variable, unreadable file, or empty key fails plugin startup.
 
 ```yaml
 # EPP pod spec (Python renderer)
@@ -454,6 +466,7 @@ configured model and `max_model_len` through `GET /v1/models`. Unknown targets,
 failed probes, and observations older than 90 seconds are excluded. Probes run
 every 30 seconds with at most four concurrent requests and a two-second timeout
 per target. New endpoints can wait until the next probe cycle. Probes use
+the `vllm.apiKeyEnv` or `vllm.apiKeyFile` key when configured, else
 `VLLM_API_KEY` when set; they do not use an incoming request's credentials.
 The models endpoint verifies model metadata, not render-route availability.
 

@@ -151,6 +151,9 @@ type discoveredEndpointPicker struct {
 	ordered      []string
 	loadBalancer endpointLoadBalancer
 	portRules    []compiledEndpointPortRule
+	// authHeader is the configured render credential for model-limit probes;
+	// empty falls back to VLLM_API_KEY.
+	authHeader string
 }
 
 // newDiscoveredEndpointPicker constructs a picker with the configured algorithm.

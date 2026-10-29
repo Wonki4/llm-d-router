@@ -182,6 +182,49 @@ type vllmConfig struct {
 	// server certificate. Use for self-signed certificates in development
 	// or when the cluster manages its own PKI.
 	InsecureSkipVerify bool `json:"insecureSkipVerify,omitempty"`
+	// APIKey is rejected: the key would land in the plugin ConfigMap. It is
+	// declared only so a plaintext key fails loudly instead of being ignored.
+	APIKey string `json:"apiKey,omitempty"`
+	// APIKeyEnv names an environment variable holding the render endpoint's
+	// API key. When set (or APIKeyFile is), every render call and probe sends
+	// it as a Bearer token in place of the inbound Authorization header.
+	APIKeyEnv string `json:"apiKeyEnv,omitempty"`
+	// APIKeyFile is a file holding the render endpoint's API key, e.g. a
+	// mounted Secret. Mutually exclusive with APIKeyEnv.
+	APIKeyFile string `json:"apiKeyFile,omitempty"`
+}
+
+// resolveRenderAPIKey returns the configured render API key, or "" when none is
+// configured. The key is read once, so a rotated key needs an EPP restart.
+func resolveRenderAPIKey(cfg *vllmConfig) (string, error) {
+	if cfg.APIKey != "" {
+		return "", errors.New("'apiKey' is not accepted; use 'apiKeyEnv' or 'apiKeyFile'")
+	}
+	if cfg.APIKeyEnv != "" && cfg.APIKeyFile != "" {
+		return "", errors.New("'apiKeyEnv' and 'apiKeyFile' are mutually exclusive")
+	}
+	var key string
+	switch {
+	case cfg.APIKeyEnv != "":
+		value, ok := os.LookupEnv(cfg.APIKeyEnv)
+		if !ok {
+			return "", fmt.Errorf("render API key environment variable %q is not set", cfg.APIKeyEnv)
+		}
+		key = value
+	case cfg.APIKeyFile != "":
+		value, err := os.ReadFile(cfg.APIKeyFile)
+		if err != nil {
+			return "", fmt.Errorf("read render API key file %q: %w", cfg.APIKeyFile, err)
+		}
+		key = strings.TrimRight(string(value), "\r\n")
+	default:
+		return "", nil
+	}
+	// An empty key would send "Bearer " and fail every render with a 401.
+	if key == "" {
+		return "", errors.New("render API key is empty")
+	}
+	return key, nil
 }
 
 // vllmHTTPRenderer implements the tokenizer interface by calling vLLM's
@@ -194,6 +237,9 @@ type vllmHTTPRenderer struct {
 	attemptTimeout time.Duration
 	prefillOnly    bool
 	omitMMKwargs   bool
+	// authHeader is the configured render credential ("Bearer <key>"). When
+	// set it replaces the inbound and warmup Authorization on every call.
+	authHeader string
 	// pluginName is the plugin_name label on the render metrics.
 	pluginName string
 	failureLog rate.Sometimes
@@ -240,6 +286,17 @@ func newVLLMHTTPRenderer(cfg *vllmConfig) (*vllmHTTPRenderer, error) {
 	if err != nil {
 		return nil, err
 	}
+	apiKey, err := resolveRenderAPIKey(cfg)
+	if err != nil {
+		return nil, err
+	}
+	var authHeader string
+	if apiKey != "" {
+		authHeader = "Bearer " + apiKey
+	}
+	if discovered, ok := endpointPicker.(*discoveredEndpointPicker); ok {
+		discovered.authHeader = authHeader
+	}
 	return &vllmHTTPRenderer{
 		client: &http.Client{Transport: otelhttp.NewTransport(&renderTraceTransport{base: transport}, otelhttp.WithSpanNameFormatter(
 			// Name the outbound span after the render route instead of the
@@ -254,6 +311,7 @@ func newVLLMHTTPRenderer(cfg *vllmConfig) (*vllmHTTPRenderer, error) {
 		attemptTimeout: attemptTimeout,
 		prefillOnly:    cfg.PrefillOnly,
 		omitMMKwargs:   cfg.OmitMMKwargs,
+		authHeader:     authHeader,
 		failureLog:     rate.Sometimes{Interval: renderFailureLogInterval},
 	}, nil
 }
@@ -587,9 +645,13 @@ func (r *vllmHTTPRenderer) postJSONAttempt(reqCtx context.Context, baseURL, path
 		return false, fmt.Errorf("build request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	// The render endpoint may require the same credential as inference;
-	// forward the inbound Authorization when present.
-	if auth := authHeaderFromContext(reqCtx); auth != "" {
+	// A configured render key wins. Otherwise the render endpoint may require
+	// the same credential as inference; forward the inbound Authorization.
+	auth := r.authHeader
+	if auth == "" {
+		auth = authHeaderFromContext(reqCtx)
+	}
+	if auth != "" {
 		httpReq.Header.Set("Authorization", auth)
 	}
 

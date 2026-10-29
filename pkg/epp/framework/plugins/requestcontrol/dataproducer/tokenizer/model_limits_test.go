@@ -339,10 +339,43 @@ func TestModelLimitStaleProbeCannotResurrectDeletedEndpoint(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestDiscoveredModelLimitsAuthorization(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		apiKeyEnv string
+		want      string
+	}{
+		{name: "configured key", apiKeyEnv: "RENDER_API_KEY_TEST", want: "Bearer render-secret"},
+		{name: "falls back to VLLM_API_KEY", want: "Bearer warmup-secret"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(vllmAPIKeyEnvVar, "warmup-secret")
+			t.Setenv("RENDER_API_KEY_TEST", "render-secret")
+			var auth atomic.Value
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				auth.Store(r.Header.Get("Authorization"))
+				_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{map[string]any{"id": "glm", "max_model_len": 300000}}})
+			}))
+			defer server.Close()
+			host, port, _ := net.SplitHostPort(server.Listener.Addr().String())
+			r, err := newVLLMHTTPRenderer(&vllmConfig{
+				EndpointDiscovery: &endpointDiscoveryConfig{DiscoverModelLimits: true},
+				APIKeyEnv:         tc.apiKeyEnv,
+			})
+			require.NoError(t, err)
+			p := r.endpointPicker.(*discoveredEndpointPicker)
+			ep := discoveredEndpointWithRank("a", host, port, 0, nil)
+			require.NoError(t, p.Upsert(ep.GetMetadata()))
+			p.refreshModelLimits(context.Background(), server.Client(), "glm")
+			assert.Equal(t, tc.want, auth.Load())
+		})
+	}
+}
+
 func TestReadModelLimitRejectsWrongModelAndInvalidMetadata(t *testing.T) {
 	for _, body := range []string{`{"data":[{"id":"other","max_model_len":300000}]}`, `{"data":[{"id":"glm","max_model_len":0}]}`, `{"data":[{"id":"glm","max_model_len":"300000"}]}`, "invalid"} {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(body)) }))
-		_, err := readModelLimit(context.Background(), server.Client(), server.URL, "glm")
+		_, err := readModelLimit(context.Background(), server.Client(), server.URL, "glm", "")
 		require.Error(t, err)
 		server.Close()
 	}

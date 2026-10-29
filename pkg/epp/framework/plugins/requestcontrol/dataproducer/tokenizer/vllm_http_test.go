@@ -429,6 +429,98 @@ func TestRenderBackend_WarmupUsesAPIKeyEnv(t *testing.T) {
 	assert.NoError(t, ctx.Err(), "warmup must succeed and return before the retry interval")
 }
 
+func TestResolveRenderAPIKey(t *testing.T) {
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "api-key")
+	require.NoError(t, os.WriteFile(keyFile, []byte("file-secret\n"), 0o600))
+	emptyFile := filepath.Join(dir, "empty")
+	require.NoError(t, os.WriteFile(emptyFile, []byte("\n"), 0o600))
+	t.Setenv("RENDER_API_KEY_TEST", "env-secret")
+	t.Setenv("RENDER_API_KEY_EMPTY", "")
+
+	for _, tc := range []struct {
+		name    string
+		cfg     vllmConfig
+		want    string
+		wantErr string
+	}{
+		{name: "unset", cfg: vllmConfig{}},
+		{name: "env", cfg: vllmConfig{APIKeyEnv: "RENDER_API_KEY_TEST"}, want: "env-secret"},
+		{name: "file trims trailing newline", cfg: vllmConfig{APIKeyFile: keyFile}, want: "file-secret"},
+		{name: "plaintext rejected", cfg: vllmConfig{APIKey: "plain"}, wantErr: "'apiKey' is not accepted"},
+		{name: "env and file exclusive", cfg: vllmConfig{APIKeyEnv: "RENDER_API_KEY_TEST", APIKeyFile: keyFile}, wantErr: "mutually exclusive"},
+		{name: "env missing", cfg: vllmConfig{APIKeyEnv: "RENDER_API_KEY_MISSING"}, wantErr: "is not set"},
+		{name: "env empty", cfg: vllmConfig{APIKeyEnv: "RENDER_API_KEY_EMPTY"}, wantErr: "is empty"},
+		{name: "file missing", cfg: vllmConfig{APIKeyFile: filepath.Join(dir, "missing")}, wantErr: "read render API key file"},
+		{name: "file empty", cfg: vllmConfig{APIKeyFile: emptyFile}, wantErr: "is empty"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveRenderAPIKey(&tc.cfg)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+
+			// The renderer constructor surfaces the same result.
+			_, err = newVLLMHTTPRenderer(&tc.cfg)
+			require.NoError(t, err)
+		})
+	}
+
+	_, err := newVLLMHTTPRenderer(&vllmConfig{APIKey: "plain"})
+	require.ErrorContains(t, err, "'apiKey' is not accepted", "the constructor must reject a plaintext key")
+}
+
+func TestProduce_VLLMHTTPConfiguredAPIKeyReplacesAuthorization(t *testing.T) {
+	t.Setenv("RENDER_API_KEY_TEST", "render-secret")
+	srv, cap := httpFixture(t,
+		[]renderResponse{{TokenIDs: []uint32{1}}}, renderResponse{TokenIDs: []uint32{2}})
+	defer srv.Close()
+
+	r, err := newVLLMHTTPRenderer(&vllmConfig{URL: srv.URL, APIKeyEnv: "RENDER_API_KEY_TEST"})
+	require.NoError(t, err)
+	p := newTestPlugin(r)
+
+	chatReq := func(headers map[string]string) *scheduling.InferenceRequest {
+		return &scheduling.InferenceRequest{
+			Headers: headers,
+			Body: &fwkrh.InferenceRequestBody{
+				RawBody: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+				ChatCompletions: &fwkrh.ChatCompletionsRequest{
+					Messages: []fwkrh.Message{{Role: "user", Content: fwkrh.Content{Raw: "hi"}}},
+				},
+			},
+		}
+	}
+
+	require.NoError(t, p.Produce(context.Background(), chatReq(map[string]string{"authorization": "Bearer client-token"}), nil))
+	assert.Equal(t, "Bearer render-secret", cap.chatAuth, "the configured key must replace the client's Authorization")
+
+	cap.chatAuth = ""
+	require.NoError(t, p.Produce(context.Background(), chatReq(nil), nil))
+	assert.Equal(t, "Bearer render-secret", cap.chatAuth, "the configured key must be sent without a client Authorization")
+}
+
+func TestRenderBackend_WarmupPrefersConfiguredAPIKey(t *testing.T) {
+	srv, cap := httpFixture(t,
+		[]renderResponse{{TokenIDs: []uint32{1}}}, renderResponse{TokenIDs: []uint32{2}})
+	defer srv.Close()
+
+	t.Setenv(vllmAPIKeyEnvVar, "warmup-secret")
+	t.Setenv("RENDER_API_KEY_TEST", "render-secret")
+	r, err := newVLLMHTTPRenderer(&vllmConfig{URL: srv.URL, APIKeyEnv: "RENDER_API_KEY_TEST"})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), warmupRetryInterval/2)
+	defer cancel()
+	renderBackend{tk: r, warmupAuth: vllmWarmupAuthHeader()}.warmup(ctx) // wired as in NewPlugin
+
+	assert.Equal(t, "Bearer render-secret", cap.chatAuth)
+	assert.NoError(t, ctx.Err(), "warmup must succeed and return before the retry interval")
+}
+
 func TestVLLMHTTPRenderer_RenderMultiPrompt(t *testing.T) {
 	srv, _ := httpFixture(t,
 		[]renderResponse{

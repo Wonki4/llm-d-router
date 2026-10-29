@@ -77,6 +77,10 @@ func (p *discoveredEndpointPicker) refreshModelLimits(ctx context.Context, clien
 		snapshot[id] = c
 	}
 	p.mu.RUnlock()
+	auth := p.authHeader
+	if auth == "" {
+		auth = vllmWarmupAuthHeader()
+	}
 	semaphore := make(chan struct{}, 4)
 	var wg sync.WaitGroup
 	for id, c := range snapshot {
@@ -92,7 +96,7 @@ func (p *discoveredEndpointPicker) refreshModelLimits(ctx context.Context, clien
 			defer func() { <-semaphore }()
 			probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 			defer cancel()
-			limit, err := readModelLimit(probeCtx, client, c.url, model)
+			limit, err := readModelLimit(probeCtx, client, c.url, model, auth)
 			p.mu.Lock()
 			changed := false
 			if p.capabilities[id] == c {
@@ -112,12 +116,12 @@ func (p *discoveredEndpointPicker) refreshModelLimits(ctx context.Context, clien
 	wg.Wait()
 }
 
-func readModelLimit(ctx context.Context, client *http.Client, url, model string) (int, error) {
+func readModelLimit(ctx context.Context, client *http.Client, url, model, auth string) (int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url+attrmodels.OpenAIModelsPath, nil)
 	if err != nil {
 		return 0, err
 	}
-	if auth := vllmWarmupAuthHeader(); auth != "" {
+	if auth != "" {
 		req.Header.Set("Authorization", auth)
 	}
 	resp, err := client.Do(req)
